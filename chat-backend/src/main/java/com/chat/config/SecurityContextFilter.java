@@ -19,7 +19,7 @@ import java.util.Map;
 @Order(Ordered.HIGHEST_PRECEDENCE + 99)
 @Slf4j
 public class SecurityContextFilter implements ChannelInterceptor {
-    
+     
     @Override
     public Message<?> preSend(Message<?> message, MessageChannel channel) {
         StompHeaderAccessor accessor = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);

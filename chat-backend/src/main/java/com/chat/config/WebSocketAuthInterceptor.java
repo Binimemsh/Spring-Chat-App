@@ -29,7 +29,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 @Slf4j
 public class WebSocketAuthInterceptor implements ChannelInterceptor {
-    
+	//https://github.com/Binimemsh/Spring-Chat-App.git
     private final JwtService jwtService;
     private final UserDetailsService userDetailsService;
     private final SecurityContextHolderStrategy securityContextHolderStrategy = 

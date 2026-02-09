@@ -1,5 +1,6 @@
 package com.chat.config;
 
+
 import com.chat.security.JwtAuthenticationFilter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
