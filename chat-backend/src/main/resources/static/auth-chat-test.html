@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Authenticated Chat Test</title>
+    <!-- Correct CDN links -->
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        textarea { width: 100%; max-width: 800px; }
+        button { padding: 10px 15px; margin: 5px; background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        #messages { border: 1px solid #ccc; padding: 10px; margin-top: 20px; height: 400px; overflow: auto; }
+        .message { margin: 5px 0; padding: 5px; border-radius: 3px; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .info { background: #d1ecf1; color: #0c5460; }
+    </style>
+</head>
+<body>
+    <h1>Authenticated Chat Test</h1>
+    
+    <div style="margin: 20px 0;">
+        <h3>Step 1: Check Libraries</h3>
+        <button onclick="checkLibraries()">Check if Libraries Loaded</button>
+        <div id="libraryStatus"></div>
+    </div>
+    
+    <div style="margin: 20px 0;">
+        <h3>Step 2: Enter JWT Token (from login response)</h3>
+        <textarea id="jwtToken" rows="3" cols="80" placeholder="Paste your JWT token here...">eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJqb2huX2RvZSIsImlhdCI6MTc3MDQ3MDQ1NCwiZXhwIjoxNzcwNTU2ODU0fQ.V_llcyRWR02297B4JFTweREr6KJgbZoC7RJ-bC3JyVk</textarea>
+        <br><br>
+        <button onclick="connectWithAuth()">Connect with JWT</button>
+        <button onclick="connectWithoutAuth()">Connect Without Auth (Test)</button>
+    </div>
+    
+    <div style="margin: 20px 0;">
+        <h3>Step 3: Chat</h3>
+        <input id="messageInput" placeholder="Type message..." style="width: 300px; padding: 8px;">
+        <button onclick="sendMessage()">Send</button>
+        <button onclick="getActiveUsers()">Get Active Users</button>
+        <button onclick="disconnect()">Disconnect</button>
+    </div>
+    
+    <div id="messages"></div>
+    
+    <script>
+        // Check if libraries are loaded
+        function checkLibraries() {
+            const statusDiv = document.getElementById('libraryStatus');
+            let html = '<h4>Library Status:</h4>';
+            
+            if (typeof SockJS !== 'undefined') {
+                html += '<p class="success">✅ SockJS loaded: v' + (SockJS.version || 'unknown') + '</p>';
+            } else {
+                html += '<p class="error">❌ SockJS NOT loaded</p>';
+            }
+            
+            if (typeof Stomp !== 'undefined') {
+                html += '<p class="success">✅ Stomp.js loaded</p>';
+            } else {
+                html += '<p class="error">❌ Stomp.js NOT loaded</p>';
+            }
+            
+            statusDiv.innerHTML = html;
+        }
+        
+        let stompClient = null;
+        let username = 'john_doe';
+        
+        function connectWithAuth() {
+            const token = document.getElementById('jwtToken').value.trim();
+            if (!token) {
+                alert('Please enter JWT token');
+                return;
+            }
+            
+            log('Connecting with JWT...', 'info');
+            
+            // Try different approaches
+            
+            // Approach 1: Pass token in headers
+            try {
+                const socket = new SockJS('http://localhost:8080/ws');
+                stompClient = Stomp.over(socket);
+                
+                // Disable debug logs
+                stompClient.debug = null;
+                
+                // Connect with token in headers
+                const headers = {
+                    'Authorization': 'Bearer ' + token
+                };
+                
+                stompClient.connect(headers, 
+                    // Success callback
+                    function(frame) {
+                        log('✅ Connected as authenticated user: ' + username, 'success');
+                        log('Frame: ' + JSON.stringify(frame), 'info');
+                        
+                        setupSubscriptions();
+                        
+                        // Join chat
+                        stompClient.send("/app/chat.addUser", {}, 
+                            JSON.stringify({
+                                sender: username,
+                                type: 'JOIN'
+                            }));
+                        
+                    }, 
+                    // Error callback
+                    function(error) {
+                        log('❌ Connection error: ' + error, 'error');
+                        console.error('STOMP error:', error);
+                    }
+                );
+                
+            } catch (error) {
+                log('❌ Exception: ' + error.message, 'error');
+                console.error('Exception:', error);
+            }
+        }
+        
+        function connectWithoutAuth() {
+            log('Connecting without authentication...', 'info');
+            
+            try {
+                const socket = new SockJS('http://localhost:8080/ws');
+                stompClient = Stomp.over(socket);
+                stompClient.debug = null;
+                
+                stompClient.connect({}, 
+                    function(frame) {
+                        log('✅ Connected (no auth): ' + frame, 'success');
+                        
+                        setupSubscriptions();
+                        
+                        // Join chat
+                        stompClient.send("/app/chat.addUser", {}, 
+                            JSON.stringify({
+                                sender: 'guest_' + Date.now(),
+                                type: 'JOIN'
+                            }));
+                        
+                    }, 
+                    function(error) {
+                        log('❌ Connection error: ' + error, 'error');
+                    }
+                );
+                
+            } catch (error) {
+                log('❌ Exception: ' + error.message, 'error');
+            }
+        }
+        
+        function setupSubscriptions() {
+            // Subscribe to public messages
+            stompClient.subscribe('/topic/public', function(message) {
+                const msg = JSON.parse(message.body);
+                log('📨 ' + msg.sender + ': ' + msg.content + ' [' + msg.type + ']', 'info');
+            });
+            
+            // Subscribe to private messages
+            stompClient.subscribe('/user/queue/private', function(message) {
+                const msg = JSON.parse(message.body);
+                log('🔒 Private from ' + msg.sender + ': ' + msg.content, 'info');
+            });
+            
+            // Subscribe to active users
+            stompClient.subscribe('/topic/activeUsers', function(message) {
+                const users = JSON.parse(message.body);
+                log('👥 Active users: ' + users.length + ' - ' + users.join(', '), 'info');
+            });
+        }
+        
+        function sendMessage() {
+            if (!stompClient || !stompClient.connected) {
+                alert('Not connected');
+                return;
+            }
+            
+            const message = document.getElementById('messageInput').value;
+            if (!message) {
+                alert('Please enter a message');
+                return;
+            }
+            
+            const msg = {
+                sender: username,
+                content: message,
+                type: 'CHAT',
+                timestamp: new Date().toISOString(),
+                roomId: 'general'
+            };
+            
+            stompClient.send("/app/chat.sendMessage", {}, JSON.stringify(msg));
+            log('📤 You: ' + message, 'info');
+            document.getElementById('messageInput').value = '';
+        }
+        
+        function getActiveUsers() {
+            if (stompClient && stompClient.connected) {
+                stompClient.send("/app/chat.getActiveUsers", {}, {});
+                log('Requested active users list...', 'info');
+            } else {
+                log('Not connected', 'error');
+            }
+        }
+        
+        function disconnect() {
+            if (stompClient) {
+                stompClient.disconnect();
+                log('👋 Disconnected', 'info');
+            }
+        }
+        
+        function log(message, type = 'info') {
+            const messagesDiv = document.getElementById('messages');
+            const div = document.createElement('div');
+            div.className = 'message ' + type;
+            div.textContent = '[' + new Date().toLocaleTimeString() + '] ' + message;
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            
+            // Also log to console
+            if (type === 'error') {
+                console.error(message);
+            } else {
+                console.log(message);
+            }
+        }
+        
+        // Handle Enter key
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // Auto-check libraries on page load
+        window.onload = function() {
+            setTimeout(checkLibraries, 100);
+            log('Ready! Check if libraries loaded, then connect.', 'info');
+        };
+    </script>
+</body>
+</html>
