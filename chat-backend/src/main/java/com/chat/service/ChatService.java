@@ -1,6 +1,8 @@
 package com.chat.service;
 
+import com.chat.config.WebSocketAuthInterceptor;
 import com.chat.dto.ChatMessageDTO;
+import com.chat.dto.UserDTO;
 import com.chat.model.ChatMessage;
 import com.chat.model.ChatRoom;
 import com.chat.model.User;
@@ -16,10 +18,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -32,77 +32,115 @@ public class ChatService {
     private final UserRepository userRepository;
     private final ChatRoomRepository chatRoomRepository;
     
-    public ChatMessage saveMessage(ChatMessageDTO chatMessageDTO) {
-        User sender = userRepository.findByUsername(chatMessageDTO.getSender())
-                .orElseThrow(() -> new RuntimeException("User not found: " + chatMessageDTO.getSender()));
-        
+    public ChatMessage saveMessage(ChatMessageDTO dto, User sender) {
         ChatMessage message = new ChatMessage();
-        message.setType(chatMessageDTO.getType());
-        message.setContent(chatMessageDTO.getContent());
+        message.setType(dto.getType());
+        message.setContent(dto.getContent());
         message.setSender(sender);
-        message.setReceiverId(chatMessageDTO.getReceiverId());
-        message.setRoomId(chatMessageDTO.getRoomId());
+        message.setReceiverId(dto.getReceiverId());
+        message.setRoomId(dto.getRoomId() != null ? dto.getRoomId() : "general");
         message.setTimestamp(LocalDateTime.now());
         message.setRead(false);
         
         return chatMessageRepository.save(message);
     }
     
+    @Transactional(readOnly = true)
     public List<ChatMessageDTO> getMessagesByRoom(String roomId, int limit, int offset) {
-        // Calculate page number
         int page = offset / limit;
         Pageable pageable = PageRequest.of(page, limit, Sort.by("timestamp").descending());
+        List<ChatMessage> messages = chatMessageRepository.findByRoomIdOrderByTimestampDesc(roomId, pageable);
         
-        // Get all messages and then apply pagination manually since we don't have the repository method
-        List<ChatMessage> allMessages = chatMessageRepository.findByRoomId(roomId);
+        // Reverse to get chronological order
+        Collections.reverse(messages);
         
-        return allMessages.stream()
-                .skip(offset)
-                .limit(limit)
+        return messages.stream()
                 .map(ChatMessageDTO::fromEntity)
                 .collect(Collectors.toList());
     }
     
+    @Transactional(readOnly = true)
     public List<ChatMessageDTO> getPrivateMessages(Long user1Id, Long user2Id, int limit, int offset) {
-        // Get all private messages between two users
-        List<ChatMessage> allMessages = chatMessageRepository.findPrivateMessages(user1Id, user2Id);
+        int page = offset / limit;
+        Pageable pageable = PageRequest.of(page, limit, Sort.by("timestamp").descending());
+        List<ChatMessage> messages = chatMessageRepository.findPrivateMessages(user1Id, user2Id, pageable);
         
-        return allMessages.stream()
-                .skip(offset)
-                .limit(limit)
+        // Reverse to get chronological order
+        Collections.reverse(messages);
+        
+        return messages.stream()
                 .map(ChatMessageDTO::fromEntity)
                 .collect(Collectors.toList());
     }
     
-    public List<ChatRoom> getPublicRooms() {
-        return chatRoomRepository.findPublicRooms();
-    }
-    
-    public ChatRoom createRoom(ChatRoom room, User creator) {
-        room.setCreatedBy(creator);
-        room.setCreatedAt(LocalDateTime.now());
-        room.getMembers().add(creator);
-        return chatRoomRepository.save(room);
-    }
-    
-    public ChatRoom joinRoom(Long roomId, User user) {
-        ChatRoom room = chatRoomRepository.findById(roomId)
-                .orElseThrow(() -> new RuntimeException("Room not found"));
+    @Transactional(readOnly = true)
+    public List<UserDTO> getOnlineUsers() {
+        // Get users from active WebSocket sessions
+        List<User> onlineUsers = new ArrayList<>(WebSocketAuthInterceptor.activeSessions.values()
+                .stream()
+                .collect(Collectors.toMap(
+                    User::getId,
+                    user -> user,
+                    (existing, replacement) -> existing
+                ))
+                .values());
         
-        if (!room.getMembers().contains(user)) {
-            room.getMembers().add(user);
-            return chatRoomRepository.save(room);
+        log.info("Found {} online users from WebSocket sessions", onlineUsers.size());
+        
+        // Update database status
+        for (User user : onlineUsers) {
+            User dbUser = userRepository.findById(user.getId()).orElse(null);
+            if (dbUser != null) {
+                dbUser.setOnline(true);
+                dbUser.setLastSeen(LocalDateTime.now());
+                userRepository.save(dbUser);
+            }
         }
         
-        return room;
+        // Set offline for users not in active sessions
+        List<User> allUsers = userRepository.findAll();
+        for (User user : allUsers) {
+            boolean isOnline = onlineUsers.stream()
+                    .anyMatch(u -> u.getId().equals(user.getId()));
+            if (!isOnline && user.getOnline()) {
+                user.setOnline(false);
+                userRepository.save(user);
+            }
+        }
+        
+        return onlineUsers.stream()
+                .map(this::convertToDTO)
+                .collect(Collectors.toList());
     }
     
-    public List<User> getOnlineUsers() {
-        return userRepository.findOnlineUsers();
+    @Transactional(readOnly = true)
+    public List<UserDTO> searchUsers(String query) {
+        List<User> users = userRepository.searchByUsername(query);
+        return users.stream()
+                .map(this::convertToDTO)
+                .collect(Collectors.toList());
     }
     
-    public List<User> searchUsers(String query) {
-        return userRepository.searchByUsername(query);
+    @Transactional(readOnly = true)
+    public List<ChatRoom> getPublicRooms() {
+        List<ChatRoom> rooms = chatRoomRepository.findPublicRooms();
+        if (rooms.isEmpty()) {
+            // Create default rooms if none exist
+            ChatRoom general = new ChatRoom();
+            general.setName("general");
+            general.setDescription("General Chat Room");
+            general.setIsPrivate(false);
+            chatRoomRepository.save(general);
+            
+            ChatRoom random = new ChatRoom();
+            random.setName("random");
+            random.setDescription("Random Discussions");
+            random.setIsPrivate(false);
+            chatRoomRepository.save(random);
+            
+            rooms = chatRoomRepository.findPublicRooms();
+        }
+        return rooms;
     }
     
     public void markMessageAsRead(Long messageId) {
@@ -114,59 +152,49 @@ public class ChatService {
     
     public void markAllMessagesAsRead(Long userId, Long otherUserId) {
         List<ChatMessage> messages = chatMessageRepository.findPrivateMessages(userId, otherUserId);
-        messages.forEach(msg -> {
-            if (msg.getSender().getId().equals(otherUserId)) {
-                msg.setRead(true);
-            }
-        });
-        chatMessageRepository.saveAll(messages);
-    }
-    
-    public long getUnreadMessageCount(Long userId, Long otherUserId) {
-        // Count unread messages from otherUserId to userId
-        List<ChatMessage> messages = chatMessageRepository.findPrivateMessages(userId, otherUserId);
-        return messages.stream()
+        messages.stream()
                 .filter(msg -> msg.getSender().getId().equals(otherUserId) && !msg.getRead())
-                .count();
+                .forEach(msg -> msg.setRead(true));
+        chatMessageRepository.saveAll(messages);
+        log.info("Marked {} messages as read between {} and {}", messages.size(), userId, otherUserId);
     }
     
-    // New method: Get recent conversations
+    @Transactional(readOnly = true)
+    public long getUnreadMessageCount(Long userId, Long otherUserId) {
+        return chatMessageRepository.countUnreadMessages(userId, otherUserId);
+    }
+    
+    @Transactional(readOnly = true)
     public List<Map<String, Object>> getRecentConversations(Long userId) {
         List<Map<String, Object>> conversations = new ArrayList<>();
         
         // Get all users the current user has chatted with
-        List<ChatMessage> allUserMessages = chatMessageRepository.findAll()
-                .stream()
-                .filter(msg -> 
-                    (msg.getSender().getId().equals(userId) && msg.getReceiverId() != null) ||
-                    (msg.getReceiverId() != null && msg.getReceiverId().equals(userId))
-                )
-                .collect(Collectors.toList());
+        List<ChatMessage> allMessages = chatMessageRepository.findAll();
         
-        // Group by other user
-        Map<Long, List<ChatMessage>> messagesByUser = allUserMessages.stream()
-                .collect(Collectors.groupingBy(msg -> {
-                    if (msg.getSender().getId().equals(userId)) {
-                        return msg.getReceiverId();
-                    } else {
-                        return msg.getSender().getId();
-                    }
-                }));
+        Map<Long, List<ChatMessage>> messagesByUser = new HashMap<>();
         
-        // Create conversation objects
+        for (ChatMessage msg : allMessages) {
+            Long otherUserId = null;
+            if (msg.getSender().getId().equals(userId) && msg.getReceiverId() != null) {
+                otherUserId = msg.getReceiverId();
+            } else if (msg.getReceiverId() != null && msg.getReceiverId().equals(userId)) {
+                otherUserId = msg.getSender().getId();
+            }
+            
+            if (otherUserId != null) {
+                messagesByUser.computeIfAbsent(otherUserId, k -> new ArrayList<>()).add(msg);
+            }
+        }
+        
         for (Map.Entry<Long, List<ChatMessage>> entry : messagesByUser.entrySet()) {
             Long otherUserId = entry.getKey();
             List<ChatMessage> userMessages = entry.getValue();
             
-            // Sort messages by timestamp to get the latest
             userMessages.sort((m1, m2) -> m2.getTimestamp().compareTo(m1.getTimestamp()));
-            
             ChatMessage lastMessage = userMessages.get(0);
             
-            // Get user info
             User otherUser = userRepository.findById(otherUserId).orElse(null);
             if (otherUser != null) {
-                // Count unread messages
                 long unreadCount = userMessages.stream()
                         .filter(msg -> msg.getSender().getId().equals(otherUserId) && !msg.getRead())
                         .count();
@@ -174,37 +202,36 @@ public class ChatService {
                 Map<String, Object> conversation = new HashMap<>();
                 conversation.put("otherUserId", otherUserId);
                 conversation.put("otherUsername", otherUser.getUsername());
+                conversation.put("otherUserEmail", otherUser.getEmail());
+                conversation.put("otherUserOnline", otherUser.getOnline());
                 conversation.put("lastMessage", lastMessage.getContent());
-                conversation.put("lastMessageTime", lastMessage.getTimestamp());
+                conversation.put("lastMessageTime", lastMessage.getTimestamp().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
                 conversation.put("unreadCount", unreadCount);
                 
                 conversations.add(conversation);
             }
         }
         
-        // Sort by last message time
+        // Sort by last message time (most recent first)
         conversations.sort((c1, c2) -> 
-            ((LocalDateTime) c2.get("lastMessageTime")).compareTo((LocalDateTime) c1.get("lastMessageTime"))
+            ((String) c2.get("lastMessageTime")).compareTo((String) c1.get("lastMessageTime"))
         );
         
         return conversations;
     }
     
-    // New method: Get messages with pagination support
-    public List<ChatMessageDTO> getMessagesWithPagination(String roomId, int page, int size) {
-        // This is a simplified version - in production you'd want proper pagination
-        List<ChatMessage> messages = chatMessageRepository.findByRoomId(roomId);
-        
-        int start = page * size;
-        int end = Math.min(start + size, messages.size());
-        
-        if (start >= messages.size()) {
-            return new ArrayList<>();
-        }
-        
-        return messages.subList(start, end)
-                .stream()
-                .map(ChatMessageDTO::fromEntity)
-                .collect(Collectors.toList());
+    private UserDTO convertToDTO(User user) {
+        return new UserDTO(
+                user.getId(),
+                user.getUsername(),
+                user.getEmail(),
+                user.getFirstName(),
+                user.getLastName(),
+                user.getProfilePictureUrl(),
+                user.getOnline(),
+                user.getLastSeen(),
+                user.getCreatedAt(),
+                user.getRoles()
+        );
     }
 }

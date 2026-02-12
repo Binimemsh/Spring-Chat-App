@@ -39,7 +39,7 @@ public class ChatController {
     public void handleWebSocketConnectListener(SessionConnectedEvent event) {
         StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
         String sessionId = headerAccessor.getSessionId();
-        log.info("✅ New WebSocket connection established: {}", sessionId);
+        log.info("New WebSocket connection: {}", sessionId);
     }
     
     @EventListener
@@ -52,7 +52,6 @@ public class ChatController {
             log.info("User disconnected: {} (session: {})", username, sessionId);
             userSessions.remove(sessionId);
             
-            // Update user status
             User user = userRepository.findByUsername(username).orElse(null);
             if (user != null) {
                 user.setOnline(false);
@@ -60,7 +59,6 @@ public class ChatController {
                 userRepository.save(user);
             }
             
-            // Notify other users
             ChatMessageDTO chatMessage = new ChatMessageDTO();
             chatMessage.setType(ChatMessage.MessageType.LEAVE);
             chatMessage.setSender(username);
@@ -76,63 +74,42 @@ public class ChatController {
     public ChatMessageDTO sendMessage(@Payload ChatMessageDTO chatMessageDTO,
                                      SimpMessageHeaderAccessor headerAccessor) {
         
-        log.info("💬 [Controller] Received sendMessage request");
+        log.info("[Controller] Received public message");
         
         // Get user from authentication
         Authentication auth = (Authentication) headerAccessor.getUser();
-        String username = null;
-        Long userId = null;
+        User user = null;
         
         if (auth != null && auth.isAuthenticated()) {
-            if (auth.getPrincipal() instanceof User) {
-                User user = (User) auth.getPrincipal();
-                username = user.getUsername();
-                userId = user.getId();
-            } else if (auth.getPrincipal() instanceof org.springframework.security.core.userdetails.User) {
-                org.springframework.security.core.userdetails.User userDetails = 
-                    (org.springframework.security.core.userdetails.User) auth.getPrincipal();
-                username = userDetails.getUsername();
-                // Get user from database
-                User user = userRepository.findByUsername(username).orElse(null);
-                if (user != null) {
-                    userId = user.getId();
-                }
-            } else if (auth.getPrincipal() instanceof String) {
-                username = (String) auth.getPrincipal();
-                User user = userRepository.findByUsername(username).orElse(null);
-                if (user != null) {
-                    userId = user.getId();
+            Object principal = auth.getPrincipal();
+            if (principal instanceof User) {
+                user = (User) principal;
+            } else {
+                Map<String, Object> sessionAttrs = headerAccessor.getSessionAttributes();
+                if (sessionAttrs != null) {
+                    user = (User) sessionAttrs.get("user");
                 }
             }
         }
         
-        // Fallback to sender in DTO
-        if (username == null && chatMessageDTO.getSender() != null) {
-            username = chatMessageDTO.getSender();
-            User user = userRepository.findByUsername(username).orElse(null);
-            if (user != null) {
-                userId = user.getId();
-            }
+        if (user == null) {
+            log.error("No authenticated user found!");
+            return null;
         }
         
-        if (username == null) {
-            username = "unknown_user";
-            log.warn("⚠️ Could not determine username, using fallback: {}", username);
-        }
+        log.info("Processing message from '{}' (ID: {}): {}", 
+            user.getUsername(), user.getId(), chatMessageDTO.getContent());
         
-        log.info("💬 Processing message from '{}' (ID: {}): {}", username, userId, chatMessageDTO.getContent());
-        
-        // Set sender and timestamp
-        chatMessageDTO.setSender(username);
-        chatMessageDTO.setSenderId(userId);
+        chatMessageDTO.setSender(user.getUsername());
+        chatMessageDTO.setSenderId(user.getId());
         chatMessageDTO.setTimestamp(LocalDateTime.now());
         chatMessageDTO.setType(ChatMessage.MessageType.CHAT);
+        chatMessageDTO.setRoomId("general");
         
-        // Save to database
         try {
-            ChatMessage savedMessage = chatService.saveMessage(chatMessageDTO);
+            ChatMessage savedMessage = chatService.saveMessage(chatMessageDTO, user);
             chatMessageDTO.setId(savedMessage.getId());
-            log.info("💾 Saved message ID: {}", savedMessage.getId());
+            log.info("Saved public message ID: {}", savedMessage.getId());
         } catch (Exception e) {
             log.error("❌ Save error: {}", e.getMessage());
         }
@@ -147,32 +124,104 @@ public class ChatController {
         Authentication auth = (Authentication) headerAccessor.getUser();
         
         if (auth == null) {
-            log.error("No authentication found for addUser");
+            log.error("No authentication for addUser");
             return null;
         }
         
-        String username = auth.getName();
-        String sessionId = headerAccessor.getSessionId();
+        Object principal = auth.getPrincipal();
+        User user = null;
         
-        log.info("User joined: {} (session: {})", username, sessionId);
-        
-        // Store user session
-        userSessions.put(sessionId, username);
-        
-        // Update user status
-        User user = userRepository.findByUsername(username).orElse(null);
-        if (user != null) {
-            user.setOnline(true);
-            user.setLastSeen(LocalDateTime.now());
-            userRepository.save(user);
+        if (principal instanceof User) {
+            user = (User) principal;
+        } else {
+            Map<String, Object> sessionAttrs = headerAccessor.getSessionAttributes();
+            if (sessionAttrs != null) {
+                user = (User) sessionAttrs.get("user");
+            }
         }
         
-        chatMessageDTO.setSender(username);
+        if (user == null) {
+            log.error("Could not get user from authentication");
+            return null;
+        }
+        
+        String sessionId = headerAccessor.getSessionId();
+        log.info("User joined: {} (session: {})", user.getUsername(), sessionId);
+        
+        userSessions.put(sessionId, user.getUsername());
+        
+        user.setOnline(true);
+        user.setLastSeen(LocalDateTime.now());
+        userRepository.save(user);
+        
+        chatMessageDTO.setSender(user.getUsername());
         chatMessageDTO.setType(ChatMessage.MessageType.JOIN);
         chatMessageDTO.setTimestamp(LocalDateTime.now());
-        chatMessageDTO.setContent(username + " joined the chat!");
+        chatMessageDTO.setContent(user.getUsername() + " joined the chat!");
         
         return chatMessageDTO;
+    }
+    
+    @MessageMapping("/chat.private")
+    public void sendPrivateMessage(@Payload ChatMessageDTO chatMessageDTO,
+                                  SimpMessageHeaderAccessor headerAccessor) {
+        
+        log.info("[PRIVATE] Received private message request");
+        
+        Authentication auth = (Authentication) headerAccessor.getUser();
+        User sender = null;
+        
+        if (auth != null && auth.isAuthenticated()) {
+            Object principal = auth.getPrincipal();
+            if (principal instanceof User) {
+                sender = (User) principal;
+            } else {
+                Map<String, Object> sessionAttrs = headerAccessor.getSessionAttributes();
+                if (sessionAttrs != null) {
+                    sender = (User) sessionAttrs.get("user");
+                }
+            }
+        }
+        
+        if (sender == null) {
+            log.error("No sender found!");
+            return;
+        }
+        
+        Long receiverId = chatMessageDTO.getReceiverId();
+        if (receiverId == null) {
+            log.error("No receiver specified!");
+            return;
+        }
+        
+        log.info("🔒 Private message from '{}' (ID:{}) to user ID: {}", 
+            sender.getUsername(), sender.getId(), receiverId);
+        
+        chatMessageDTO.setSender(sender.getUsername());
+        chatMessageDTO.setSenderId(sender.getId());
+        chatMessageDTO.setTimestamp(LocalDateTime.now());
+        chatMessageDTO.setType(ChatMessage.MessageType.CHAT);
+        
+        ChatMessage savedMessage = chatService.saveMessage(chatMessageDTO, sender);
+        ChatMessageDTO savedDTO = ChatMessageDTO.fromEntity(savedMessage);
+        
+        log.info("Saved private message ID: {}", savedMessage.getId());
+        
+        // Send to receiver
+        messagingTemplate.convertAndSendToUser(
+            receiverId.toString(),
+            "/queue/private",
+            savedDTO
+        );
+        log.info("Sent to user ID {} at /user/{}/queue/private", receiverId, receiverId);
+        
+        // Send to sender (for their own view)
+        messagingTemplate.convertAndSendToUser(
+            sender.getId().toString(),
+            "/queue/private",
+            savedDTO
+        );
+        log.info("Sent copy to sender ID: {}", sender.getId());
     }
     
     @MessageMapping("/chat.typing")
@@ -185,7 +234,18 @@ public class ChatController {
             return null;
         }
         
-        String username = auth.getName();
+        Object principal = auth.getPrincipal();
+        String username = null;
+        
+        if (principal instanceof User) {
+            username = ((User) principal).getUsername();
+        } else if (principal instanceof String) {
+            username = (String) principal;
+        }
+        
+        if (username == null) {
+            return null;
+        }
         
         chatMessageDTO.setSender(username);
         chatMessageDTO.setType(ChatMessage.MessageType.TYPING);
@@ -195,86 +255,10 @@ public class ChatController {
         return chatMessageDTO;
     }
     
-    @MessageMapping("/chat.private")
-    public void sendPrivateMessage(@Payload ChatMessageDTO chatMessageDTO,
-                                  SimpMessageHeaderAccessor headerAccessor) {
-        
-        log.info("🔒 [PRIVATE] Received private message request");
-        
-        // Get sender info
-        String sender = null;
-        Long senderId = null;
-        
-        if (headerAccessor != null) {
-            Authentication auth = (Authentication) headerAccessor.getUser();
-            if (auth != null && auth.isAuthenticated()) {
-                Object principal = auth.getPrincipal();
-                if (principal instanceof User) {
-                    sender = ((User) principal).getUsername();
-                    senderId = ((User) principal).getId();
-                } else if (principal instanceof org.springframework.security.core.userdetails.User) {
-                    sender = ((org.springframework.security.core.userdetails.User) principal).getUsername();
-                    User senderUser = userRepository.findByUsername(sender).orElse(null);
-                    if (senderUser != null) {
-                        senderId = senderUser.getId();
-                    }
-                }
-            }
-        }
-        
-        // Fallback to DTO sender
-        if (sender == null && chatMessageDTO.getSender() != null) {
-            sender = chatMessageDTO.getSender();
-            User senderUser = userRepository.findByUsername(sender).orElse(null);
-            if (senderUser != null) {
-                senderId = senderUser.getId();
-            }
-        }
-        
-        Long receiverId = chatMessageDTO.getReceiverId();
-        
-        if (sender == null || senderId == null || receiverId == null) {
-            log.error("❌ Cannot send private: sender={}, senderId={}, receiverId={}", 
-                sender, senderId, receiverId);
-            return;
-        }
-        
-        log.info("🔒 Private message from '{}' (ID:{}) to user ID: {}", sender, senderId, receiverId);
-        
-        // Set sender info in DTO
-        chatMessageDTO.setSender(sender);
-        chatMessageDTO.setSenderId(senderId);
-        chatMessageDTO.setTimestamp(LocalDateTime.now());
-        chatMessageDTO.setType(ChatMessage.MessageType.CHAT);
-        
-        // Save to database
-        ChatMessage savedMessage = chatService.saveMessage(chatMessageDTO);
-        ChatMessageDTO savedDTO = ChatMessageDTO.fromEntity(savedMessage);
-        
-        log.info("💾 Saved private message ID: {}", savedMessage.getId());
-        
-        // Send to receiver (user-specific destination)
-        messagingTemplate.convertAndSendToUser(
-            receiverId.toString(),
-            "/queue/private",
-            savedDTO
-        );
-        log.info("📤 Sent to user ID {} at /user/{}/queue/private", receiverId, receiverId);
-        
-        // Also send to sender (so they see their own message)
-        messagingTemplate.convertAndSendToUser(
-            senderId.toString(),
-            "/queue/private",
-            savedDTO
-        );
-        log.info("📥 Sent copy to sender ID: {}", senderId);
-    }
-    
-    // Simple ping endpoint for testing
     @MessageMapping("/chat.ping")
     @SendTo("/topic/ping")
     public String ping() {
-        log.info("🏓 Ping received");
+        log.info("Ping received");
         return "pong - " + LocalDateTime.now();
     }
 }

@@ -1,25 +1,21 @@
 package com.chat.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.Ordered;
-import org.springframework.core.annotation.Order;
-import org.springframework.messaging.Message;
-import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.converter.DefaultContentTypeResolver;
+import org.springframework.messaging.converter.MappingJackson2MessageConverter;
+import org.springframework.messaging.converter.MessageConverter;
 import org.springframework.messaging.simp.config.ChannelRegistration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
-import org.springframework.messaging.simp.stomp.StompCommand;
-import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
-import org.springframework.messaging.support.ChannelInterceptor;
-import org.springframework.messaging.support.MessageHeaderAccessor;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
 import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.List;
 
 @Configuration
 @EnableWebSocketMessageBroker
@@ -28,10 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     private final WebSocketAuthInterceptor webSocketAuthInterceptor;
-    private final SecurityContextFilter securityContextFilter;
-    
-    // Track active sessions for better management
-    private final Map<String, Map<String, Object>> activeSessions = new ConcurrentHashMap<>();
+    private final ObjectMapper objectMapper;
 
     @Override
     public void registerStompEndpoints(StompEndpointRegistry registry) {
@@ -40,14 +33,15 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
                 .withSockJS()
                 .setClientLibraryUrl("https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js");
         
-        // Additional endpoint for native WebSocket
         registry.addEndpoint("/ws-native")
                 .setAllowedOriginPatterns("*");
+        
+        // Set heartbeat timeouts
+        registry.setPreserveReceiveOrder(true);
     }
 
     @Override
     public void configureMessageBroker(MessageBrokerRegistry registry) {
-        // Enable simple broker with heartbeats
         ThreadPoolTaskScheduler taskScheduler = new ThreadPoolTaskScheduler();
         taskScheduler.setPoolSize(1);
         taskScheduler.setThreadNamePrefix("websocket-heartbeat-");
@@ -63,70 +57,32 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void configureClientInboundChannel(ChannelRegistration registration) {
-        registration.interceptors(
-            webSocketAuthInterceptor,
-            securityContextFilter,
-            new EnhancedChannelInterceptor(activeSessions)
-        );
+        registration.interceptors(webSocketAuthInterceptor);
+        registration.taskExecutor()
+                .corePoolSize(2)
+                .maxPoolSize(4)
+                .keepAliveSeconds(60);
     }
-    
-    // Enhanced channel interceptor for better session management
-    @Order(Ordered.HIGHEST_PRECEDENCE + 100)
-    private static class EnhancedChannelInterceptor implements ChannelInterceptor {
+
+    @Override
+    public void configureClientOutboundChannel(ChannelRegistration registration) {
+        registration.taskExecutor()
+                .corePoolSize(2)
+                .maxPoolSize(4)
+                .keepAliveSeconds(60);
+    }
+
+    @Override
+    public boolean configureMessageConverters(List<MessageConverter> messageConverters) {
+        DefaultContentTypeResolver resolver = new DefaultContentTypeResolver();
+        resolver.setDefaultMimeType(MimeTypeUtils.APPLICATION_JSON);
         
-        private final Map<String, Map<String, Object>> activeSessions;
+        MappingJackson2MessageConverter converter = new MappingJackson2MessageConverter();
+        converter.setObjectMapper(objectMapper);
+        converter.setContentTypeResolver(resolver);
+        converter.setStrictContentTypeMatch(false);
         
-        public EnhancedChannelInterceptor(Map<String, Map<String, Object>> activeSessions) {
-            this.activeSessions = activeSessions;
-        }
-        
-        @Override
-        public Message<?> preSend(Message<?> message, MessageChannel channel) {
-            StompHeaderAccessor accessor = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
-            
-            if (accessor != null) {
-                String sessionId = accessor.getSessionId();
-                StompCommand command = accessor.getCommand();
-                
-                switch (command) {
-                    case CONNECT:
-                        log.info("📡 New WebSocket connection: {}", sessionId);
-                        break;
-                    case SUBSCRIBE:
-                        handleSubscription(accessor, sessionId);
-                        break;
-                    case DISCONNECT:
-                        handleDisconnect(sessionId);
-                        break;
-                    case SEND:
-                        log.debug("📤 Message sent via session: {}", sessionId);
-                        break;
-                }
-            }
-            
-            return message;
-        }
-        
-        private void handleSubscription(StompHeaderAccessor accessor, String sessionId) {
-            String destination = accessor.getDestination();
-            Map<String, Object> sessionInfo = activeSessions.get(sessionId);
-            
-            if (sessionInfo != null && destination != null) {
-                log.debug("📡 Session {} subscribed to: {}", sessionId, destination);
-                
-                // Track subscription
-                @SuppressWarnings("unchecked")
-                Map<String, String> subscriptions = (Map<String, String>) 
-                    sessionInfo.computeIfAbsent("subscriptions", k -> new ConcurrentHashMap<>());
-                subscriptions.put(destination, String.valueOf(System.currentTimeMillis()));
-            }
-        }
-        
-        private void handleDisconnect(String sessionId) {
-            Map<String, Object> sessionInfo = activeSessions.remove(sessionId);
-            if (sessionInfo != null) {
-                log.info("🔌 Session disconnected: {}", sessionId);
-            }
-        }
+        messageConverters.add(converter);
+        return false;
     }
 }

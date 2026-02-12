@@ -19,6 +19,9 @@ public interface UserRepository extends JpaRepository<User, Long> {
     @Query("SELECT u FROM User u WHERE u.online = true")
     List<User> findOnlineUsers();
     
-    @Query("SELECT u FROM User u WHERE u.username LIKE %:username%")
+    @Query("SELECT u FROM User u WHERE LOWER(u.username) LIKE LOWER(CONCAT('%', :username, '%'))")
     List<User> searchByUsername(@Param("username") String username);
+    
+    @Query("SELECT u FROM User u WHERE u.id <> :userId AND u.online = true")
+    List<User> findOtherOnlineUsers(@Param("userId") Long userId);
 }
